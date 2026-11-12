@@ -97,6 +97,19 @@ fn try_gui_askpass(prompt: &str) -> Option<Zeroizing<String>> {
         }
     }
 
+    // Try ksshaskpass
+    if let Ok(output) = Command::new("ksshaskpass")
+        .arg(prompt)
+        .output()
+    {
+        if output.status.success() {
+            let pass = String::from_utf8_lossy(&output.stdout)
+                .trim_end_matches(['\r', '\n'])
+                .to_string();
+            return Some(Zeroizing::new(pass));
+        }
+    }
+
     None
 }
 
