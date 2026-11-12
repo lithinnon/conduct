@@ -102,7 +102,7 @@
 
             programs.ssh = lib.mkIf cfg.enableSshAskpass {
               enableAskPassword = lib.mkDefault true;
-              askPassword = lib.mkDefault "/run/current-system/sw/bin/conduct";
+              askPassword = "/run/current-system/sw/bin/conduct";
             };
 
             systemd.user.services.conduct-watch = lib.mkIf cfg.enableTouchDetector {
