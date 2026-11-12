@@ -96,12 +96,14 @@
             environment.systemPackages = [ cfg.package ];
             environment.variables = lib.mkMerge [
               (lib.mkIf cfg.enableSudoAskpass {
-                SUDO_ASKPASS = "${cfg.package}/bin/conduct";
-              })
-              (lib.mkIf cfg.enableSshAskpass {
-                SSH_ASKPASS = "${cfg.package}/bin/conduct";
+                SUDO_ASKPASS = lib.mkDefault "/run/current-system/sw/bin/conduct";
               })
             ];
+
+            programs.ssh = lib.mkIf cfg.enableSshAskpass {
+              enableAskPassword = lib.mkDefault true;
+              askPassword = lib.mkDefault "/run/current-system/sw/bin/conduct";
+            };
 
             systemd.user.services.conduct-watch = lib.mkIf cfg.enableTouchDetector {
               description = "Conduct YubiKey and PAM U2F touch detection daemon";
@@ -149,10 +151,10 @@
             home.packages = [ cfg.package ];
             home.sessionVariables = lib.mkMerge [
               (lib.mkIf cfg.enableSudoAskpass {
-                SUDO_ASKPASS = "${cfg.package}/bin/conduct";
+                SUDO_ASKPASS = lib.mkDefault "${config.home.profileDirectory}/bin/conduct";
               })
               (lib.mkIf cfg.enableSshAskpass {
-                SSH_ASKPASS = "${cfg.package}/bin/conduct";
+                SSH_ASKPASS = lib.mkDefault "${config.home.profileDirectory}/bin/conduct";
               })
             ];
 
