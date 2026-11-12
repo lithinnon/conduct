@@ -2,7 +2,8 @@ use crate::notify::{self, ActiveNotification};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -16,6 +17,23 @@ const CTAPHID_MSG: u8 = TYPE_INIT | 0x03; // 0x83
 const CTAPHID_KEEPALIVE: u8 = TYPE_INIT | 0x3b; // 0xbb
 const STATUS_UPNEEDED: u8 = 0x02;
 const U2F_SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
+
+// HID Report Descriptor ioctls & constants
+const HIDIOCGRDESCSIZE: libc::c_ulong = 0x8004_4801;
+const HIDIOCGRDESC: libc::c_ulong = 0x9004_4802;
+
+const FIDO_USAGE_PAGE: u16 = 0xf1d0;
+const FIDO_USAGE_CTAPHID: u8 = 0x01;
+const HID_ITEM_TYPE_GLOBAL: u8 = 1;
+const HID_ITEM_TYPE_LOCAL: u8 = 2;
+const HID_GLOBAL_ITEM_TAG_USAGE_PAGE: u8 = 0;
+const HID_LOCAL_ITEM_TAG_USAGE: u8 = 0;
+
+#[repr(C)]
+struct HidrawReportDescriptor {
+    size: u32,
+    value: [u8; 4096],
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TouchEvent {
@@ -93,6 +111,78 @@ impl TouchCoordinator {
     pub fn is_active(&self) -> bool {
         !self.active_sources.is_empty()
     }
+}
+
+/// Inspect the HID report descriptor of a /dev/hidraw device to verify if it is a
+/// dedicated FIDO CTAPHID authenticator interface (FIDO_USAGE_PAGE 0xf1d0 & FIDO_USAGE_CTAPHID 0x01).
+/// This filters out non-FIDO devices (keyboards, mice, trackpads, OTP keyboards).
+pub fn is_fido_device(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let fd = file.as_raw_fd();
+
+    let mut desc_size: u32 = 0;
+    if unsafe { libc::ioctl(fd, HIDIOCGRDESCSIZE, &mut desc_size) } < 0 {
+        return false;
+    }
+
+    if desc_size == 0 || desc_size > 4096 {
+        return false;
+    }
+
+    let mut desc = HidrawReportDescriptor {
+        size: desc_size,
+        value: [0u8; 4096],
+    };
+
+    if unsafe { libc::ioctl(fd, HIDIOCGRDESC, &mut desc) } < 0 {
+        return false;
+    }
+
+    let mut is_fido = false;
+    let mut has_u2f = false;
+    let mut i = 0;
+    let size = desc.size as usize;
+
+    while i < size {
+        let prefix = desc.value[i];
+        let tag = (prefix & 0b1111_0000) >> 4;
+        let typ = (prefix & 0b0000_1100) >> 2;
+        let mut item_size = (prefix & 0b0000_0011) as usize;
+        if item_size == 3 {
+            item_size = 4;
+        }
+
+        if i + 1 < size {
+            let val1b = desc.value[i + 1];
+            let val2b = if i + 2 < size {
+                (val1b as u16) | ((desc.value[i + 2] as u16) << 8)
+            } else {
+                val1b as u16
+            };
+
+            if typ == HID_ITEM_TYPE_GLOBAL
+                && tag == HID_GLOBAL_ITEM_TAG_USAGE_PAGE
+                && val2b == FIDO_USAGE_PAGE
+            {
+                is_fido = true;
+            } else if typ == HID_ITEM_TYPE_LOCAL
+                && tag == HID_LOCAL_ITEM_TAG_USAGE
+                && val1b == FIDO_USAGE_CTAPHID
+            {
+                has_u2f = true;
+            }
+        }
+
+        if is_fido && has_u2f {
+            return true;
+        }
+
+        i += item_size + 1;
+    }
+
+    false
 }
 
 /// Watch PAM U2F touch file and /dev for new devices using pure blocking Linux inotify.
@@ -184,54 +274,103 @@ pub fn watch_inotify(
     Ok(())
 }
 
-/// Watch a specific /dev/hidraw device for FIDO/U2F CTAPHID packets requesting user presence.
-/// Pure event-driven blocking read: thread sleeps in kernel until USB hardware reports an interrupt packet.
+/// Watch a specific /dev/hidraw FIDO device for CTAPHID packets requesting user presence.
+/// Pure event-driven kernel syscalls via libc::poll:
+/// - When idle: blocks indefinitely (timeout = -1) with 0.00 Hz wakeups.
+/// - When active: debounces 100ms keepalives with a 2.0s holdoff and 250ms completion holdoff,
+///   completely eliminating desktop notification flapping / seizures.
 fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running: Arc<AtomicBool>) {
-    let Ok(mut file) = File::open(&device_path) else {
+    let Ok(mut file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&device_path)
+    else {
         return;
     };
 
+    let raw_fd = file.as_raw_fd();
     let source_id = format!("hidraw:{}", device_path.display());
     let mut buf = [0u8; 64];
     let mut is_active = false;
+    let mut poll_timeout_ms: i32 = -1; // Infinite wait while idle
 
-    // Use blocking reads with a read timeout (1.5s) only when active.
-    // While idle, blocking read sleeps in the kernel with 0 wakeups.
+    let mut poll_fds = [libc::pollfd {
+        fd: raw_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+
     while running.load(Ordering::Relaxed) {
-        match file.read(&mut buf) {
-            Ok(n) if n >= 9 => {
-                let cmd = buf[4];
-                let val1 = buf[7];
-                let val2 = ((buf[7] as u16) << 8) | (buf[8] as u16);
+        let ret = unsafe {
+            libc::poll(
+                poll_fds.as_mut_ptr(),
+                poll_fds.len() as libc::nfds_t,
+                poll_timeout_ms,
+            )
+        };
 
-                let waiting = (cmd == CTAPHID_KEEPALIVE && val1 == STATUS_UPNEEDED)
-                    || (cmd == CTAPHID_MSG && val2 == U2F_SW_CONDITIONS_NOT_SATISFIED);
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
 
-                if waiting && !is_active {
-                    is_active = true;
-                    let _ = sender.send(TouchEvent::Active {
-                        source: source_id.clone(),
-                        reason: "hardware authentication (FIDO2 / SSH)".to_string(),
-                    });
-                } else if !waiting && is_active {
-                    is_active = false;
-                    let _ = sender.send(TouchEvent::Inactive {
-                        source: source_id.clone(),
-                    });
-                }
+        // Timeout expired: no keepalive or trailing packets arrived within the window
+        if ret == 0 {
+            if is_active {
+                is_active = false;
+                let _ = sender.send(TouchEvent::Inactive {
+                    source: source_id.clone(),
+                });
             }
-            Ok(_) => {
-                // Packet arrived but not waiting for touch
-                if is_active {
-                    is_active = false;
-                    let _ = sender.send(TouchEvent::Inactive {
-                        source: source_id.clone(),
-                    });
+            poll_timeout_ms = -1; // Reset to infinite blocking kernel sleep
+            continue;
+        }
+
+        let revents = poll_fds[0].revents;
+        if (revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+            break;
+        }
+
+        if (revents & libc::POLLIN) != 0 {
+            match file.read(&mut buf) {
+                Ok(n) if n >= 9 => {
+                    let cmd = buf[4];
+                    let val1 = buf[7];
+                    let val2 = ((buf[7] as u16) << 8) | (buf[8] as u16);
+
+                    let waiting = (cmd == CTAPHID_KEEPALIVE && val1 == STATUS_UPNEEDED)
+                        || (cmd == CTAPHID_MSG && val2 == U2F_SW_CONDITIONS_NOT_SATISFIED);
+
+                    if waiting {
+                        if !is_active {
+                            is_active = true;
+                            let _ = sender.send(TouchEvent::Active {
+                                source: source_id.clone(),
+                                reason: "hardware authentication (FIDO2 / SSH)".to_string(),
+                            });
+                        }
+                        // Refresh holdoff window: 2000ms until next expected keepalive
+                        poll_timeout_ms = 2000;
+                    } else if is_active {
+                        // Non-waiting packet while active (e.g. response payload upon touch):
+                        // Hold active for 250ms to swallow any trailing continuation packets
+                        poll_timeout_ms = 250;
+                    }
                 }
-            }
-            Err(_) => {
-                // Device disconnected or read error
-                break;
+                Ok(_) => {
+                    if is_active {
+                        poll_timeout_ms = 250;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(_) => {
+                    break;
+                }
             }
         }
     }
@@ -241,7 +380,7 @@ fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running
     }
 }
 
-/// Discover all current /dev/hidraw devices.
+/// Discover all current /dev/hidraw FIDO authenticators.
 fn find_hidraw_devices() -> Vec<PathBuf> {
     let mut devices = Vec::new();
     let Ok(entries) = fs::read_dir("/dev") else {
@@ -254,7 +393,7 @@ fn find_hidraw_devices() -> Vec<PathBuf> {
         if name_str.starts_with("hidraw") {
             let path = Path::new("/dev").join(&name);
             if let Ok(meta) = entry.metadata() {
-                if meta.file_type().is_char_device() {
+                if meta.file_type().is_char_device() && is_fido_device(&path) {
                     devices.push(path);
                 }
             }
@@ -299,15 +438,16 @@ pub fn run_watch(verbose: bool) -> io::Result<()> {
         if active_devices.insert(dev.clone()) {
             let dev_sender = sender.clone();
             let dev_running = running.clone();
+            let dev_path = dev.clone();
             thread::spawn(move || {
-                watch_hidraw_device(dev, dev_sender, dev_running);
+                watch_hidraw_device(dev_path, dev_sender, dev_running);
             });
         }
     }
 
     if verbose {
         println!(
-            "conduct: monitoring {} hidraw devices (blocking kernel reads)",
+            "conduct: monitoring {} genuine FIDO hidraw devices (blocking kernel reads)",
             active_devices.len()
         );
     }
@@ -321,21 +461,16 @@ pub fn run_watch(verbose: bool) -> io::Result<()> {
     while running.load(Ordering::Relaxed) {
         match receiver.recv() {
             Ok(TouchEvent::NewDevice { path }) => {
-                if active_devices.insert(path.clone()) {
-                    if verbose {
-                        println!(
-                            "conduct: detected new authenticator device: {}",
-                            path.display()
-                        );
+                let dev_sender = sender.clone();
+                let dev_running = running.clone();
+                let dev_path = path.clone();
+                thread::spawn(move || {
+                    // Brief wait for udev permissions and ACLs to settle
+                    thread::sleep(Duration::from_millis(150));
+                    if is_fido_device(&dev_path) {
+                        watch_hidraw_device(dev_path, dev_sender, dev_running);
                     }
-                    let dev_sender = sender.clone();
-                    let dev_running = running.clone();
-                    thread::spawn(move || {
-                        // Brief wait for udev permissions to settle
-                        thread::sleep(Duration::from_millis(100));
-                        watch_hidraw_device(path, dev_sender, dev_running);
-                    });
-                }
+                });
             }
             Ok(event) => {
                 if verbose {
@@ -369,7 +504,7 @@ mod tests {
 
         // Event from HIDRAW (concurrent)
         coord.handle_event(TouchEvent::Active {
-            source: "hidraw:5".to_string(),
+            source: "hidraw:6".to_string(),
             reason: "ssh".to_string(),
         });
         assert!(coord.is_active());
@@ -383,9 +518,32 @@ mod tests {
 
         // HIDRAW finishes
         coord.handle_event(TouchEvent::Inactive {
-            source: "hidraw:5".to_string(),
+            source: "hidraw:6".to_string(),
         });
         // Now inactive!
         assert!(!coord.is_active());
+    }
+
+    #[test]
+    fn test_touch_coordinator_deduplication() {
+        let mut coord = TouchCoordinator::new();
+
+        // Repeated active events from keepalive packets for same source
+        coord.handle_event(TouchEvent::Active {
+            source: "hidraw:6".to_string(),
+            reason: "ssh".to_string(),
+        });
+        coord.handle_event(TouchEvent::Active {
+            source: "hidraw:6".to_string(),
+            reason: "ssh".to_string(),
+        });
+        assert!(coord.is_active());
+        assert_eq!(coord.active_sources.len(), 1);
+
+        coord.handle_event(TouchEvent::Inactive {
+            source: "hidraw:6".to_string(),
+        });
+        assert!(!coord.is_active());
+        assert_eq!(coord.active_sources.len(), 0);
     }
 }
