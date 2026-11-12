@@ -86,6 +86,26 @@ pub fn send_elevation_notification(
     Ok(ActiveNotification::new(handle))
 }
 
+/// Send a desktop notification alerting the user that a YubiKey / FIDO touch is required.
+pub fn send_touch_notification(reason: &str) -> Result<ActiveNotification, NotifyError> {
+    let summary = "YubiKey Touch Required";
+    let body = format!("Touch your YubiKey to authenticate {}.", reason);
+
+    let timeout = Timeout::Milliseconds(25_000);
+
+    let handle = Notification::new()
+        .appname("conduct")
+        .summary(summary)
+        .body(&body)
+        .icon("security-high")
+        .urgency(Urgency::Critical)
+        .timeout(timeout)
+        .show()
+        .map_err(|e| NotifyError::DbusError(e.to_string()))?;
+
+    Ok(ActiveNotification::new(handle))
+}
+
 /// Send a notification with custom fields.
 pub fn send_notification(
     app_name: &str,

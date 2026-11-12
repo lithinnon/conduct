@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 notify-rust = "4"
 zeroize = { version = "1", features = ["derive"] }
 rpassword = "7"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

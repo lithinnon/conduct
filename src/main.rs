@@ -1,6 +1,7 @@
 mod askpass;
 mod notify;
 mod proc;
+mod watch;
 
 use askpass::AskpassOptions;
 use clap::{Args, Parser, Subcommand};
@@ -51,6 +52,16 @@ enum Commands {
 
     /// Test the prompt and desktop notification safely without leaking credentials
     Test(TestArgs),
+
+    /// Watch for YubiKey/FIDO touch requests and dispatch instant desktop cues
+    Watch(WatchArgs),
+}
+
+#[derive(Args, Debug)]
+struct WatchArgs {
+    /// Enable verbose event logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Args, Debug)]
@@ -202,6 +213,12 @@ fn main() -> ExitCode {
                     eprintln!("conduct: test error: {}", e);
                     return ExitCode::FAILURE;
                 }
+            }
+        }
+        Some(Commands::Watch(args)) => {
+            if let Err(e) = watch::run_watch(args.verbose) {
+                eprintln!("conduct: watch daemon error: {}", e);
+                return ExitCode::FAILURE;
             }
         }
         None => {

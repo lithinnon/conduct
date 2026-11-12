@@ -85,6 +85,11 @@
               default = false;
               description = "Whether to configure conduct as SSH_ASKPASS.";
             };
+            enableTouchDetector = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Whether to run conduct watch daemon in user session for YubiKey touch detection.";
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -97,6 +102,17 @@
                 SSH_ASKPASS = "${cfg.package}/bin/conduct";
               })
             ];
+
+            systemd.user.services.conduct-watch = lib.mkIf cfg.enableTouchDetector {
+              description = "Conduct YubiKey and PAM U2F touch detection daemon";
+              wantedBy = [ "graphical-session.target" ];
+              partOf = [ "graphical-session.target" ];
+              serviceConfig = {
+                ExecStart = "${cfg.package}/bin/conduct watch";
+                Restart = "always";
+                RestartSec = "2";
+              };
+            };
           };
         };
 
@@ -122,6 +138,11 @@
               default = false;
               description = "Whether to configure conduct as SSH_ASKPASS.";
             };
+            enableTouchDetector = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Whether to run conduct watch daemon in user session for YubiKey touch detection.";
+            };
           };
 
           config = lib.mkIf cfg.enable {
@@ -134,6 +155,21 @@
                 SSH_ASKPASS = "${cfg.package}/bin/conduct";
               })
             ];
+
+            systemd.user.services.conduct-watch = lib.mkIf cfg.enableTouchDetector {
+              Unit = {
+                Description = "Conduct YubiKey and PAM U2F touch detection daemon";
+                PartOf = [ "graphical-session.target" ];
+              };
+              Install = {
+                WantedBy = [ "graphical-session.target" ];
+              };
+              Service = {
+                ExecStart = "${cfg.package}/bin/conduct watch";
+                Restart = "always";
+                RestartSec = "2";
+              };
+            };
           };
         };
     };

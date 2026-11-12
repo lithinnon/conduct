@@ -28,6 +28,11 @@ Without answers, granting privilege escalation becomes a leap of faith or a secu
 
 ## Features
 
+- **Unified Hardware Touch Detection (`conduct watch`)**:
+  - Eliminates silent elevation timeouts by monitoring both **PAM U2F** (`/run/user/$UID/pam-u2f-authpending` via Linux inotify) and **USB HIDRAW CTAPHID** keepalive packets on `/dev/hidraw*`.
+  - Dispatches immediate desktop cues (**"👉 Touch your YubiKey to authenticate"**) for `sudo`, SSH (`id_ed25519_sk`), GPG, Polkit, and WebAuthn.
+  - Automatically dismisses the desktop notification the moment you touch your physical authenticator.
+  - Runs natively as a lightweight systemd user service via NixOS & Home Manager modules.
 - **Deep Process Ancestry Inspection**:
   Walks `/proc/$PPID` and ancestor processes to extract:
   - Command line (`cmdline`) of the caller and the target `sudo` execution.
@@ -107,6 +112,13 @@ Print the resolved process context and ancestry tree in JSON or human-readable f
 ```bash
 conduct inspect
 conduct inspect --pid 12345 --json
+```
+
+#### `watch`
+Run the unified background daemon monitoring PAM U2F inotify and USB HIDRAW authenticators:
+```bash
+conduct watch
+conduct watch --verbose
 ```
 
 ---
