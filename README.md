@@ -3,6 +3,7 @@
 > Context-aware, notification-driven askpass and privilege orchestrator for `sudo`, `SSH`, and `Polkit`.
 
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
+[![CI](https://github.com/lithinnon/conduct/actions/workflows/ci.yml/badge.svg)](https://github.com/lithinnon/conduct/actions/workflows/ci.yml)
 
 ---
 
@@ -35,10 +36,15 @@ Without answers, granting privilege escalation becomes a leap of faith or a secu
   - Process ID (`pid`), parent PID (`ppid`), and user/UID metadata (`status`).
 - **Desktop Notifications via D-Bus**:
   Dispatches immediate, critical notifications (`org.freedesktop.Notifications`, urgency=critical) with a full breakdown of the requesting process and target command.
+  Auto-closes notifications over D-Bus the moment authentication completes or cancels, leaving zero stale notification toasts.
+- **Supervisor Provenance Guard (Anti-Log-Leak)**:
+  Direct askpass output is restricted to verified authentication supervisors (`sudo`, `doas`, `ssh`, `polkit`, `git`). Unsanctioned callers (such as background CI scripts, subagent pipes, or shell scripts) are prevented from capturing plaintext passwords into log files.
 - **Secure Askpass Flow**:
-  - Securely prompts for password with `/dev/tty` support or GUI fallback.
+  - Prioritizes graphical dialog prompts (`ksshaskpass`, `kdialog`, `zenity`) in headless/subagent sessions to prevent freezing on hidden TTYs.
+  - Interactive terminal support with masked `/dev/tty` input via `rpassword`.
   - Guarantees memory zeroization using `zeroize` before drop.
-  - Compliant with `SUDO_ASKPASS` and `SSH_ASKPASS` conventions.
+  - Safe verification mode (`conduct test`) for testing dialogs and notifications without echoing credentials to stdout.
+  - Fully compliant with `SUDO_ASKPASS`, `SSH_ASKPASS`, and `GIT_ASKPASS` conventions.
 - **Declarative NixOS & Home Manager Modules**:
   Seamlessly integrates into NixOS and standalone Home Manager environments.
 

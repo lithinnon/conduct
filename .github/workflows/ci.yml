@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  check-and-test:
+    name: Nix Flake Check & Cargo Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Check Nix Flake
+        run: nix flake check
+
+      - name: Build Conduct Package
+        run: nix build .#conduct
+
+      - name: Run Tests inside DevShell
+        run: nix develop --command cargo test --all-targets
+
+      - name: Check Formatting
+        run: nix develop --command cargo fmt --check
+
+      - name: Run Clippy Linter
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
