@@ -174,7 +174,8 @@ fn main() -> ExitCode {
         }
         Some(Commands::Test(args)) => {
             let prompt = args.prompt.or(cli.prompt).unwrap_or_else(|| {
-                "[conduct test] Enter a test password to verify GUI prompt & auto-dismissal:".to_string()
+                "[conduct test] Enter a test password to verify GUI prompt & auto-dismissal:"
+                    .to_string()
             });
 
             eprintln!("conduct: launching secure verification test...");

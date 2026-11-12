@@ -40,14 +40,18 @@ pub struct SystemPasswordReader;
 
 impl PasswordReader for SystemPasswordReader {
     fn read_password(&self, prompt: &str) -> io::Result<Zeroizing<String>> {
-        let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
-            || std::env::var_os("DISPLAY").is_some();
+        let has_display =
+            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
         let stdin_is_tty = io::stdin().is_terminal();
 
         // 1. In graphical sessions, prioritize GUI dialog (ksshaskpass, kdialog, zenity)
         // especially when stdin is not a terminal (e.g. spawned by subagents or background harness).
         // This prevents blocking on a hidden /dev/tty where the user cannot interact.
-        if has_display && (!stdin_is_tty || std::env::var_os("SUDO_ASKPASS").is_some() || std::env::var_os("SSH_ASKPASS").is_some()) {
+        if has_display
+            && (!stdin_is_tty
+                || std::env::var_os("SUDO_ASKPASS").is_some()
+                || std::env::var_os("SSH_ASKPASS").is_some())
+        {
             if let Some(pass) = try_gui_askpass(prompt) {
                 return Ok(pass);
             }
@@ -125,10 +129,7 @@ fn try_gui_askpass(prompt: &str) -> Option<Zeroizing<String>> {
     }
 
     // Try ksshaskpass
-    if let Ok(output) = Command::new("ksshaskpass")
-        .arg(prompt)
-        .output()
-    {
+    if let Ok(output) = Command::new("ksshaskpass").arg(prompt).output() {
         if output.status.success() {
             let pass = String::from_utf8_lossy(&output.stdout)
                 .trim_end_matches(['\r', '\n'])

@@ -65,7 +65,9 @@ impl Drop for ActiveNotification {
 }
 
 /// Send a desktop notification alerting the user of privilege elevation.
-pub fn send_elevation_notification(context: &ElevationContext) -> Result<ActiveNotification, NotifyError> {
+pub fn send_elevation_notification(
+    context: &ElevationContext,
+) -> Result<ActiveNotification, NotifyError> {
     let summary = "Privilege Elevation Requested";
     let body = context.format_notification_body();
 

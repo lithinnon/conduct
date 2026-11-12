@@ -124,7 +124,9 @@ impl ElevationContext {
             "openvpn",
             "vpnc",
         ];
-        SUPERVISORS.iter().any(|&s| comm == s || comm.starts_with(s))
+        SUPERVISORS
+            .iter()
+            .any(|&s| comm == s || comm.starts_with(s))
     }
 
     /// Primary actor responsible for requesting elevation.
