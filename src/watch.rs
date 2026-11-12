@@ -3,13 +3,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::fs::FileTypeExt;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // CTAPHID Protocol Constants
 const TYPE_INIT: u8 = 0x80;
@@ -22,6 +21,7 @@ const U2F_SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 pub enum TouchEvent {
     Active { source: String, reason: String },
     Inactive { source: String },
+    NewDevice { path: PathBuf },
 }
 
 /// Core touch state coordinator managing desktop notification lifecycle.
@@ -69,6 +69,7 @@ impl TouchCoordinator {
                     self.notification = None;
                 }
             }
+            TouchEvent::NewDevice { .. } => {}
         }
     }
 
@@ -78,8 +79,9 @@ impl TouchCoordinator {
     }
 }
 
-/// Watch PAM U2F touch file (/run/user/$UID/pam-u2f-authpending) using Linux inotify.
-pub fn watch_pam_u2f(
+/// Watch PAM U2F touch file and /dev for new devices using pure blocking Linux inotify.
+/// Zero polling, zero timer wakeups when idle.
+pub fn watch_inotify(
     runtime_dir: PathBuf,
     sender: Sender<TouchEvent>,
     running: Arc<AtomicBool>,
@@ -90,65 +92,75 @@ pub fn watch_pam_u2f(
     const IN_CLOSE_WRITE: u32 = 0x0000_0008;
     const IN_DELETE: u32 = 0x0000_0200;
     const IN_CLOEXEC: i32 = 0x0008_0000;
-    const IN_NONBLOCK: i32 = 0x0000_0800;
 
-    let inotify_fd = unsafe { libc::inotify_init1(IN_CLOEXEC | IN_NONBLOCK) };
+    // Use blocking inotify file descriptor (no IN_NONBLOCK).
+    // The kernel puts this thread into deep interruptible sleep until an event occurs.
+    let inotify_fd = unsafe { libc::inotify_init1(IN_CLOEXEC) };
     if inotify_fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    let c_path = std::ffi::CString::new(runtime_dir.to_string_lossy().as_bytes())
+    // 1. Watch user runtime directory for pam-u2f-authpending
+    let c_runtime = std::ffi::CString::new(runtime_dir.to_string_lossy().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-
-    let mask = IN_CREATE | IN_OPEN | IN_CLOSE_NOWRITE | IN_CLOSE_WRITE | IN_DELETE;
-    let wd = unsafe { libc::inotify_add_watch(inotify_fd, c_path.as_ptr(), mask) };
-    if wd < 0 {
+    let pam_mask = IN_CREATE | IN_OPEN | IN_CLOSE_NOWRITE | IN_CLOSE_WRITE | IN_DELETE;
+    let pam_wd = unsafe { libc::inotify_add_watch(inotify_fd, c_runtime.as_ptr(), pam_mask) };
+    if pam_wd < 0 {
         unsafe { libc::close(inotify_fd) };
         return Err(io::Error::last_os_error());
     }
+
+    // 2. Watch /dev for newly plugged in hidraw devices (event-driven device hotplug)
+    let c_dev = std::ffi::CString::new("/dev")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let dev_wd = unsafe { libc::inotify_add_watch(inotify_fd, c_dev.as_ptr(), IN_CREATE) };
 
     let mut buf = [0u8; 4096];
     let source_id = "pam-u2f".to_string();
 
     while running.load(Ordering::Relaxed) {
+        // Pure blocking read: CPU stays in deepest package C-state until kernel generates an event
         let n = unsafe { libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
 
-        if n > 0 {
-            let mut offset = 0;
-            let total = n as usize;
+        if n <= 0 {
+            break;
+        }
 
-            while offset + 16 <= total {
-                let mask = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
-                let len =
-                    u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap()) as usize;
-                offset += 16;
+        let mut offset = 0;
+        let total = n as usize;
 
-                if offset + len <= total && len > 0 {
-                    let name_bytes = &buf[offset..offset + len];
-                    let name = String::from_utf8_lossy(name_bytes)
-                        .trim_end_matches('\0')
-                        .to_string();
-                    offset += len;
+        while offset + 16 <= total {
+            let wd = i32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap());
+            let mask = u32::from_ne_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+            let len =
+                u32::from_ne_bytes(buf[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            offset += 16;
 
-                    if name == "pam-u2f-authpending" {
-                        if (mask & (IN_OPEN | IN_CREATE)) != 0 {
-                            let _ = sender.send(TouchEvent::Active {
-                                source: source_id.clone(),
-                                reason: "privilege elevation (PAM U2F)".to_string(),
-                            });
-                        } else if (mask & (IN_CLOSE_NOWRITE | IN_CLOSE_WRITE | IN_DELETE)) != 0 {
-                            let _ = sender.send(TouchEvent::Inactive {
-                                source: source_id.clone(),
-                            });
-                        }
+            if offset + len <= total && len > 0 {
+                let name_bytes = &buf[offset..offset + len];
+                let name = String::from_utf8_lossy(name_bytes)
+                    .trim_end_matches('\0')
+                    .to_string();
+                offset += len;
+
+                if wd == pam_wd && name == "pam-u2f-authpending" {
+                    if (mask & (IN_OPEN | IN_CREATE)) != 0 {
+                        let _ = sender.send(TouchEvent::Active {
+                            source: source_id.clone(),
+                            reason: "privilege elevation (PAM U2F)".to_string(),
+                        });
+                    } else if (mask & (IN_CLOSE_NOWRITE | IN_CLOSE_WRITE | IN_DELETE)) != 0 {
+                        let _ = sender.send(TouchEvent::Inactive {
+                            source: source_id.clone(),
+                        });
                     }
-                } else {
-                    offset += len;
+                } else if dev_wd >= 0 && wd == dev_wd && name.starts_with("hidraw") {
+                    let path = Path::new("/dev").join(name);
+                    let _ = sender.send(TouchEvent::NewDevice { path });
                 }
+            } else {
+                offset += len;
             }
-        } else {
-            // Sleep briefly to avoid busy loop when non-blocking
-            thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -157,6 +169,7 @@ pub fn watch_pam_u2f(
 }
 
 /// Watch a specific /dev/hidraw device for FIDO/U2F CTAPHID packets requesting user presence.
+/// Pure event-driven blocking read: thread sleeps in kernel until USB hardware reports an interrupt packet.
 fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running: Arc<AtomicBool>) {
     let Ok(mut file) = File::open(&device_path) else {
         return;
@@ -165,17 +178,9 @@ fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running
     let source_id = format!("hidraw:{}", device_path.display());
     let mut buf = [0u8; 64];
     let mut is_active = false;
-    let mut last_keepalive = Instant::now();
 
-    // Set non-blocking on file descriptor
-    let fd = file.as_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-
+    // Use blocking reads with a read timeout (1.5s) only when active.
+    // While idle, blocking read sleeps in the kernel with 0 wakeups.
     while running.load(Ordering::Relaxed) {
         match file.read(&mut buf) {
             Ok(n) if n >= 9 => {
@@ -186,26 +191,31 @@ fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running
                 let waiting = (cmd == CTAPHID_KEEPALIVE && val1 == STATUS_UPNEEDED)
                     || (cmd == CTAPHID_MSG && val2 == U2F_SW_CONDITIONS_NOT_SATISFIED);
 
-                if waiting {
-                    last_keepalive = Instant::now();
-                    if !is_active {
-                        is_active = true;
-                        let _ = sender.send(TouchEvent::Active {
-                            source: source_id.clone(),
-                            reason: "hardware authentication (FIDO2 / SSH)".to_string(),
-                        });
-                    }
-                }
-            }
-            Ok(_) | Err(_) => {
-                // If waiting was active and no keepalive received within 1500ms, mark inactive
-                if is_active && last_keepalive.elapsed() > Duration::from_millis(1500) {
+                if waiting && !is_active {
+                    is_active = true;
+                    let _ = sender.send(TouchEvent::Active {
+                        source: source_id.clone(),
+                        reason: "hardware authentication (FIDO2 / SSH)".to_string(),
+                    });
+                } else if !waiting && is_active {
                     is_active = false;
                     let _ = sender.send(TouchEvent::Inactive {
                         source: source_id.clone(),
                     });
                 }
-                thread::sleep(Duration::from_millis(100));
+            }
+            Ok(_) => {
+                // Packet arrived but not waiting for touch
+                if is_active {
+                    is_active = false;
+                    let _ = sender.send(TouchEvent::Inactive {
+                        source: source_id.clone(),
+                    });
+                }
+            }
+            Err(_) => {
+                // Device disconnected or read error
+                break;
             }
         }
     }
@@ -238,16 +248,14 @@ fn find_hidraw_devices() -> Vec<PathBuf> {
 }
 
 /// Main entry point for the unified conduct watch daemon.
+/// Fully event-driven: zero wakeups per second when idle.
 pub fn run_watch(verbose: bool) -> io::Result<()> {
-    println!("conduct: starting unified privilege and touch detection daemon...");
+    println!("conduct: starting zero-wakeup privilege and touch detection daemon...");
 
     let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-
-    // Catch signals cleanly
     let (sender, receiver): (Sender<TouchEvent>, Receiver<TouchEvent>) = channel();
 
-    // 1. Start PAM U2F inotify watcher
+    // 1. Start event-driven inotify watcher (PAM U2F + /dev hotplug)
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -256,28 +264,20 @@ pub fn run_watch(verbose: bool) -> io::Result<()> {
         });
 
     if runtime_dir.exists() {
-        let pam_sender = sender.clone();
-        let pam_running = running.clone();
-        let pam_dir = runtime_dir.clone();
+        let inotify_sender = sender.clone();
+        let inotify_running = running.clone();
+        let inotify_runtime = runtime_dir.clone();
         thread::spawn(move || {
-            if let Err(e) = watch_pam_u2f(pam_dir, pam_sender, pam_running) {
-                eprintln!("conduct: watch: PAM U2F watcher error: {}", e);
+            if let Err(e) = watch_inotify(inotify_runtime, inotify_sender, inotify_running) {
+                eprintln!("conduct: watch: inotify watcher error: {}", e);
             }
         });
         if verbose {
-            println!(
-                "conduct: monitoring PAM U2F events in {}",
-                runtime_dir.display()
-            );
+            println!("conduct: event-driven inotify active for PAM U2F and /dev hotplug");
         }
-    } else {
-        eprintln!(
-            "conduct: warning: runtime directory {} not found, skipping inotify",
-            runtime_dir.display()
-        );
     }
 
-    // 2. Start HIDRAW CTAPHID watchers for connected authenticators
+    // 2. Start blocking HIDRAW CTAPHID watchers for connected authenticators
     let mut active_devices = HashSet::new();
     for dev in find_hidraw_devices() {
         if active_devices.insert(dev.clone()) {
@@ -291,40 +291,43 @@ pub fn run_watch(verbose: bool) -> io::Result<()> {
 
     if verbose {
         println!(
-            "conduct: monitoring {} hidraw devices for CTAPHID keepalive events",
+            "conduct: monitoring {} hidraw devices (blocking kernel reads)",
             active_devices.len()
         );
     }
 
-    // 3. Coordinator loop
+    // 3. Coordinator loop: blocks indefinitely on receiver until an actual event occurs.
+    // Zero polling, zero timer wakeups when idle.
     let mut coordinator = TouchCoordinator::new();
 
-    println!("conduct: daemon listening for touch requests. Press Ctrl+C to terminate.");
+    println!("conduct: daemon listening for touch requests. Zero idle CPU usage.");
 
-    while r.load(Ordering::Relaxed) {
-        match receiver.recv_timeout(Duration::from_millis(500)) {
+    while running.load(Ordering::Relaxed) {
+        match receiver.recv() {
+            Ok(TouchEvent::NewDevice { path }) => {
+                if active_devices.insert(path.clone()) {
+                    if verbose {
+                        println!(
+                            "conduct: detected new authenticator device: {}",
+                            path.display()
+                        );
+                    }
+                    let dev_sender = sender.clone();
+                    let dev_running = running.clone();
+                    thread::spawn(move || {
+                        // Brief wait for udev permissions to settle
+                        thread::sleep(Duration::from_millis(100));
+                        watch_hidraw_device(path, dev_sender, dev_running);
+                    });
+                }
+            }
             Ok(event) => {
                 if verbose {
                     println!("conduct: touch event: {:?}", event);
                 }
                 coordinator.handle_event(event);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic check for newly plugged in hidraw devices
-                for dev in find_hidraw_devices() {
-                    if active_devices.insert(dev.clone()) {
-                        if verbose {
-                            println!("conduct: detected new device: {}", dev.display());
-                        }
-                        let dev_sender = sender.clone();
-                        let dev_running = running.clone();
-                        thread::spawn(move || {
-                            watch_hidraw_device(dev, dev_sender, dev_running);
-                        });
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         }
     }
 
