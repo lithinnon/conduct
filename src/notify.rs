@@ -34,19 +34,54 @@ impl fmt::Display for NotifyError {
 
 impl std::error::Error for NotifyError {}
 
+/// Active notification that auto-closes on Drop.
+pub struct ActiveNotification {
+    handle: Option<notify_rust::NotificationHandle>,
+}
+
+impl ActiveNotification {
+    pub fn new(handle: notify_rust::NotificationHandle) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn id(&self) -> Option<u32> {
+        self.handle.as_ref().map(|h| h.id())
+    }
+
+    pub fn close(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.close();
+        }
+    }
+}
+
+impl Drop for ActiveNotification {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// Send a desktop notification alerting the user of privilege elevation.
-pub fn send_elevation_notification(context: &ElevationContext) -> Result<u32, NotifyError> {
+pub fn send_elevation_notification(context: &ElevationContext) -> Result<ActiveNotification, NotifyError> {
     let summary = "Privilege Elevation Requested";
     let body = context.format_notification_body();
 
-    send_notification(
-        "conduct",
-        summary,
-        &body,
-        "dialog-password",
-        NotificationUrgency::Critical,
-        15_000,
-    )
+    let timeout = Timeout::Milliseconds(15_000);
+
+    let handle = Notification::new()
+        .appname("conduct")
+        .summary(summary)
+        .body(&body)
+        .icon("dialog-password")
+        .urgency(Urgency::Critical)
+        .timeout(timeout)
+        .show()
+        .map_err(|e| NotifyError::DbusError(e.to_string()))?;
+
+    Ok(ActiveNotification::new(handle))
 }
 
 /// Send a notification with custom fields.

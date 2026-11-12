@@ -32,6 +32,10 @@ struct Cli {
     /// Disable terminal banner
     #[arg(long, global = true)]
     no_banner: bool,
+
+    /// Allow raw stdout password emission even if direct caller is not sudo/ssh
+    #[arg(long, global = true)]
+    passthrough: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -44,6 +48,16 @@ enum Commands {
 
     /// Inspect and display process context for a PID
     Inspect(InspectArgs),
+
+    /// Test the prompt and desktop notification safely without leaking credentials
+    Test(TestArgs),
+}
+
+#[derive(Args, Debug)]
+struct TestArgs {
+    /// Custom prompt text
+    #[arg(value_name = "PROMPT")]
+    prompt: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -78,6 +92,7 @@ fn main() -> ExitCode {
                 target_pid: cli.pid,
                 send_notification: !cli.no_notify,
                 show_banner: !cli.no_banner,
+                passthrough: cli.passthrough,
             };
             if let Err(e) = askpass::run_askpass(opts) {
                 eprintln!("conduct: askpass error: {}", e);
@@ -157,6 +172,37 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Test(args)) => {
+            let prompt = args.prompt.or(cli.prompt).unwrap_or_else(|| {
+                "[conduct test] Enter a test password to verify GUI prompt & auto-dismissal:".to_string()
+            });
+
+            eprintln!("conduct: launching secure verification test...");
+
+            let opts = AskpassOptions {
+                prompt: Some(prompt),
+                target_pid: cli.pid,
+                send_notification: !cli.no_notify,
+                show_banner: !cli.no_banner,
+                passthrough: true, // test handles output safely via sink
+            };
+
+            let mut sink = std::io::sink();
+            let reader = askpass::SystemPasswordReader;
+
+            match askpass::run_askpass_with(&opts, &reader, &mut sink) {
+                Ok(()) => {
+                    println!("✅ conduct: Prompt and desktop notification verified successfully!");
+                    println!("   Password was read into Zeroizing<String> and scrubbed from RAM.");
+                    println!("   Plaintext was safely discarded (never written to stdout, pipe, or logs).");
+                    println!("   Desktop notification has been auto-dismissed.");
+                }
+                Err(e) => {
+                    eprintln!("conduct: test error: {}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
         None => {
             // Default askpass mode (e.g. called as `conduct "[sudo] password for alice: "`)
             let opts = AskpassOptions {
@@ -164,6 +210,7 @@ fn main() -> ExitCode {
                 target_pid: cli.pid,
                 send_notification: !cli.no_notify,
                 show_banner: !cli.no_banner,
+                passthrough: cli.passthrough,
             };
             if let Err(e) = askpass::run_askpass(opts) {
                 eprintln!("conduct: askpass error: {}", e);

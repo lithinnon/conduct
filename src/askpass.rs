@@ -14,6 +14,8 @@ pub struct AskpassOptions {
     pub send_notification: bool,
     /// Whether to print the terminal context banner
     pub show_banner: bool,
+    /// Whether to allow raw stdout passthrough even for non-supervisor callers
+    pub passthrough: bool,
 }
 
 impl Default for AskpassOptions {
@@ -23,6 +25,7 @@ impl Default for AskpassOptions {
             target_pid: None,
             send_notification: true,
             show_banner: true,
+            passthrough: false,
         }
     }
 }
@@ -156,15 +159,23 @@ pub fn run_askpass_with<R: PasswordReader, W: Write>(
         None => ElevationContext::inspect_current_caller().ok(),
     };
 
-    // 2. Desktop notification
-    if options.send_notification {
+    // 2. Desktop notification (held in scope, auto-closed on Drop when function exits)
+    let _active_notification = if options.send_notification {
         if let Some(ctx) = &context {
-            if let Err(e) = notify::send_elevation_notification(ctx) {
-                // Non-fatal warning so askpass never breaks if notification daemon is absent
-                eprintln!("conduct: notice: desktop notification unavailable ({})", e);
+            match notify::send_elevation_notification(ctx) {
+                Ok(notif) => Some(notif),
+                Err(e) => {
+                    // Non-fatal warning so askpass never breaks if notification daemon is absent
+                    eprintln!("conduct: notice: desktop notification unavailable ({})", e);
+                    None
+                }
             }
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     // 3. Print terminal banner if enabled and stderr is a terminal
     if options.show_banner && io::stderr().is_terminal() {
@@ -173,18 +184,43 @@ pub fn run_askpass_with<R: PasswordReader, W: Write>(
         }
     }
 
-    // 4. Prompt string
+    // 4. Security check: Only allow raw stdout piping if direct caller is an authorized supervisor,
+    // or if the user explicitly provided the `--passthrough` flag.
+    // This strictly prevents subagents, scripts, or terminals from accidentally leaking passwords to logs.
+    if !options.passthrough {
+        if let Some(ctx) = &context {
+            if !ctx.is_authorized_supervisor() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "conduct: security guard: direct caller '{}' (PID {}) is not a recognized privilege supervisor (sudo/ssh/doas/polkit). Plaintext password output suppressed to protect credentials from log capture. Use 'conduct test' to test safely, or pass --passthrough if direct output was intended.",
+                        ctx.direct_caller.comm, ctx.direct_caller.pid
+                    ),
+                ));
+            }
+        }
+
+        // Never dump plaintext password to an interactive terminal screen
+        if io::stdout().is_terminal() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "conduct: refusing to output plaintext password directly to an interactive terminal screen. Pass --passthrough if required.",
+            ));
+        }
+    }
+
+    // 5. Prompt string
     let prompt = options.prompt.as_deref().unwrap_or("[conduct] Password: ");
 
-    // 5. Read password and wrap in Zeroizing
+    // 6. Read password and wrap in Zeroizing
     let password = reader.read_password(prompt)?;
 
-    // 6. Write password to stdout followed by newline and flush
+    // 7. Write password to stdout followed by newline and flush
     writer.write_all(password.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 
-    // password dropped and zeroized here
+    // password dropped and zeroized here, _active_notification dropped and closed
     Ok(())
 }
 
@@ -213,11 +249,35 @@ mod tests {
             target_pid: None,
             send_notification: false,
             show_banner: false,
+            passthrough: true,
         };
 
         run_askpass_with(&options, &reader, &mut output).unwrap();
 
         assert_eq!(output, b"super_secret_password\n");
+    }
+
+    #[test]
+    fn test_security_guard_blocks_unauthorized_caller() {
+        let reader = MockPasswordReader {
+            password: "super_secret_password".to_string(),
+        };
+        let mut output = Vec::new();
+        let options = AskpassOptions {
+            prompt: Some("Enter password: ".to_string()),
+            target_pid: None,
+            send_notification: false,
+            show_banner: false,
+            passthrough: false, // blocked unless running under sudo/ssh
+        };
+
+        // When running tests, cargo test is the direct caller, not sudo/ssh!
+        let result = run_askpass_with(&options, &reader, &mut output);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("security guard"));
+        assert!(output.is_empty()); // Nothing leaked to output!
     }
 
     #[test]

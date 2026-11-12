@@ -104,6 +104,29 @@ impl ElevationContext {
         })
     }
 
+    /// Returns true if the direct caller is a known privilege supervisor (e.g. sudo, ssh, git, polkit).
+    pub fn is_authorized_supervisor(&self) -> bool {
+        let comm = self.direct_caller.comm.to_lowercase();
+        const SUPERVISORS: &[&str] = &[
+            "sudo",
+            "doas",
+            "ssh",
+            "ssh-add",
+            "git",
+            "git-credential",
+            "pkexec",
+            "polkit-agent",
+            "polkit-agent-helper-1",
+            "login",
+            "su",
+            "systemd-ask-password",
+            "openconnect",
+            "openvpn",
+            "vpnc",
+        ];
+        SUPERVISORS.iter().any(|&s| comm == s || comm.starts_with(s))
+    }
+
     /// Primary actor responsible for requesting elevation.
     pub fn primary_requester(&self) -> &ProcessInfo {
         self.origin_caller.as_ref().unwrap_or(&self.direct_caller)
