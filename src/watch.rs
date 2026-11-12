@@ -48,28 +48,44 @@ impl TouchCoordinator {
     pub fn handle_event(&mut self, event: TouchEvent) {
         match event {
             TouchEvent::Active { source, reason } => {
-                let was_empty = self.active_sources.is_empty();
-                self.active_sources.insert(source, reason.clone());
-
-                if was_empty || self.notification.is_none() {
-                    match notify::send_touch_notification(&reason) {
-                        Ok(notif) => {
-                            self.notification = Some(notif);
-                        }
-                        Err(e) => {
-                            eprintln!("conduct: watch: notification error: {}", e);
-                        }
-                    }
+                let changed = self.active_sources.insert(source, reason).is_none();
+                if changed || self.notification.is_none() {
+                    self.update_notification();
                 }
             }
             TouchEvent::Inactive { source } => {
-                self.active_sources.remove(&source);
-                if self.active_sources.is_empty() {
-                    // Dropping ActiveNotification auto-closes notification over D-Bus
-                    self.notification = None;
+                if self.active_sources.remove(&source).is_some() {
+                    if self.active_sources.is_empty() {
+                        // All operations finished: drop notification to auto-dismiss over D-Bus
+                        self.notification = None;
+                    } else {
+                        // Other operations are still pending: update notification in-place
+                        self.update_notification();
+                    }
                 }
             }
             TouchEvent::NewDevice { .. } => {}
+        }
+    }
+
+    fn update_notification(&mut self) {
+        if self.active_sources.is_empty() {
+            self.notification = None;
+            return;
+        }
+
+        let existing_id = self.notification.as_ref().and_then(|n| n.id());
+        let mut reasons: Vec<String> = self.active_sources.values().cloned().collect();
+        reasons.sort();
+        reasons.dedup();
+
+        match notify::send_or_update_touch_notification(&reasons, existing_id) {
+            Ok(notif) => {
+                self.notification = Some(notif);
+            }
+            Err(e) => {
+                eprintln!("conduct: watch: notification error: {}", e);
+            }
         }
     }
 

@@ -87,19 +87,51 @@ pub fn send_elevation_notification(
 }
 
 /// Send a desktop notification alerting the user that a YubiKey / FIDO touch is required.
+#[allow(dead_code)]
 pub fn send_touch_notification(reason: &str) -> Result<ActiveNotification, NotifyError> {
-    let summary = "YubiKey Touch Required";
-    let body = format!("Touch your YubiKey to authenticate {}.", reason);
+    send_or_update_touch_notification(&[reason.to_string()], None)
+}
+
+/// Send or update a desktop notification alerting the user that one or more YubiKey touches are required.
+/// If `existing_id` is provided, replaces the existing notification in-place without re-alerting.
+pub fn send_or_update_touch_notification(
+    reasons: &[String],
+    existing_id: Option<u32>,
+) -> Result<ActiveNotification, NotifyError> {
+    let summary = if reasons.len() > 1 {
+        format!("YubiKey Touch Required ({} operations)", reasons.len())
+    } else {
+        "YubiKey Touch Required".to_string()
+    };
+
+    let body = if reasons.is_empty() {
+        "Touch your YubiKey to authenticate.".to_string()
+    } else if reasons.len() == 1 {
+        format!("Touch your YubiKey to authenticate {}.", reasons[0])
+    } else {
+        let mut list = String::from("Touch your YubiKey to authenticate:\n");
+        for r in reasons {
+            list.push_str(&format!("  • {}\n", r));
+        }
+        list.trim_end().to_string()
+    };
 
     let timeout = Timeout::Milliseconds(25_000);
 
-    let handle = Notification::new()
+    let mut notif = Notification::new();
+    notif
         .appname("conduct")
-        .summary(summary)
+        .summary(&summary)
         .body(&body)
         .icon("security-high")
         .urgency(Urgency::Critical)
-        .timeout(timeout)
+        .timeout(timeout);
+
+    if let Some(id) = existing_id {
+        notif.id(id);
+    }
+
+    let handle = notif
         .show()
         .map_err(|e| NotifyError::DbusError(e.to_string()))?;
 
