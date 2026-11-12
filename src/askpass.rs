@@ -37,26 +37,50 @@ pub struct SystemPasswordReader;
 
 impl PasswordReader for SystemPasswordReader {
     fn read_password(&self, prompt: &str) -> io::Result<Zeroizing<String>> {
-        // 1. Try reading from /dev/tty via rpassword
-        match rpassword::prompt_password(prompt) {
-            Ok(pass) => Ok(Zeroizing::new(pass)),
-            Err(e) => {
-                // If TTY is not available (e.g. GUI app or detached daemon), attempt graphical prompt
-                if let Some(pass) = try_gui_askpass(prompt) {
-                    return Ok(pass);
-                }
+        let has_display = std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some();
+        let stdin_is_tty = io::stdin().is_terminal();
 
-                // Fall back to standard input if piped
-                if !io::stdin().is_terminal() {
-                    let mut pass = String::new();
-                    io::stdin().read_line(&mut pass)?;
-                    let trimmed = pass.trim_end_matches(['\r', '\n']).to_string();
-                    return Ok(Zeroizing::new(trimmed));
-                }
-
-                Err(e)
+        // 1. In graphical sessions, prioritize GUI dialog (ksshaskpass, kdialog, zenity)
+        // especially when stdin is not a terminal (e.g. spawned by subagents or background harness).
+        // This prevents blocking on a hidden /dev/tty where the user cannot interact.
+        if has_display && (!stdin_is_tty || std::env::var_os("SUDO_ASKPASS").is_some() || std::env::var_os("SSH_ASKPASS").is_some()) {
+            if let Some(pass) = try_gui_askpass(prompt) {
+                return Ok(pass);
             }
         }
+
+        // 2. If stdin is an interactive terminal, prompt on /dev/tty via rpassword
+        if stdin_is_tty {
+            if let Ok(pass) = rpassword::prompt_password(prompt) {
+                return Ok(Zeroizing::new(pass));
+            }
+        }
+
+        // 3. Fallback to GUI if display server is present
+        if has_display {
+            if let Some(pass) = try_gui_askpass(prompt) {
+                return Ok(pass);
+            }
+        }
+
+        // 4. Fallback to /dev/tty if available
+        if let Ok(pass) = rpassword::prompt_password(prompt) {
+            return Ok(Zeroizing::new(pass));
+        }
+
+        // 5. Fallback to piped standard input
+        if !stdin_is_tty {
+            let mut pass = String::new();
+            io::stdin().read_line(&mut pass)?;
+            let trimmed = pass.trim_end_matches(['\r', '\n']).to_string();
+            return Ok(Zeroizing::new(trimmed));
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No interactive GUI prompt, TTY, or stdin available to read password",
+        ))
     }
 }
 
