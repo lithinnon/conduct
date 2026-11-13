@@ -98,8 +98,13 @@ impl TouchCoordinator {
         reasons.dedup();
 
         match notify::send_or_update_touch_notification(&reasons, existing_id) {
-            Ok(notif) => {
-                self.notification = Some(notif);
+            Ok(new_notif) => {
+                // Disarm previous notification handle so its Drop destructor does not close
+                // the notification we just updated in-place over D-Bus!
+                if let Some(mut old) = self.notification.take() {
+                    old.disarm();
+                }
+                self.notification = Some(new_notif);
             }
             Err(e) => {
                 eprintln!("conduct: watch: notification error: {}", e);
@@ -341,7 +346,8 @@ fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running
                     let val1 = buf[7];
                     let val2 = ((buf[7] as u16) << 8) | (buf[8] as u16);
 
-                    let waiting = (cmd == CTAPHID_KEEPALIVE && val1 == STATUS_UPNEEDED)
+                    let is_keepalive = cmd == CTAPHID_KEEPALIVE;
+                    let waiting = (is_keepalive && val1 == STATUS_UPNEEDED)
                         || (cmd == CTAPHID_MSG && val2 == U2F_SW_CONDITIONS_NOT_SATISFIED);
 
                     if waiting {
@@ -354,8 +360,8 @@ fn watch_hidraw_device(device_path: PathBuf, sender: Sender<TouchEvent>, running
                         }
                         // Refresh holdoff window: 2000ms until next expected keepalive
                         poll_timeout_ms = 2000;
-                    } else if is_active {
-                        // Non-waiting packet while active (e.g. response payload upon touch):
+                    } else if is_active && !is_keepalive {
+                        // Non-waiting, non-keepalive response packet while active (e.g. assertion response upon touch):
                         // Hold active for 250ms to swallow any trailing continuation packets
                         poll_timeout_ms = 250;
                     }

@@ -56,6 +56,12 @@ impl ActiveNotification {
             h.close();
         }
     }
+
+    /// Disarm the notification handle without closing the remote notification over D-Bus.
+    /// Used when transferring ownership or replacing a notification in-place.
+    pub fn disarm(&mut self) {
+        self.handle = None;
+    }
 }
 
 impl Drop for ActiveNotification {
@@ -178,5 +184,13 @@ mod tests {
         );
         assert_eq!(Urgency::from(NotificationUrgency::Normal), Urgency::Normal);
         assert_eq!(Urgency::from(NotificationUrgency::Low), Urgency::Low);
+    }
+
+    #[test]
+    fn test_active_notification_disarm() {
+        let mut notif = ActiveNotification { handle: None };
+        assert!(notif.id().is_none());
+        notif.disarm();
+        assert!(notif.handle.is_none());
     }
 }
